@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Gatekeeper</title>
+<style>
+:root{--bg:#c9c9bf;--bezel:#2b2b28;color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#1d1d1b;--bezel:#000;color-scheme:dark;}}
+:root[data-theme="dark"]{--bg:#1d1d1b;--bezel:#000;color-scheme:dark;}
+html{height:100%;}
+body{height:100%;margin:0;background:var(--bg);display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;}
+#bezel{background:var(--bezel);padding:6px;border-radius:8px;line-height:0;}
+canvas{display:block;outline:none;image-rendering:pixelated;image-rendering:crisp-edges;max-width:100%;}
+</style>
+</head>
+<body>
+<div id="bezel"><canvas id="game" aria-label="Gatekeeper game: hold any key, click or tap to lift the reject gate"></canvas></div>
+<script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+<script>
+(() => {
+'use strict';
+const { Engine, Bodies, Body, Composite, Events } = window.Matter;
+
+// ================= canvas =================
+const W = 320, H = 180, STEP = 1 / 60;
+const cvs = document.getElementById('game');
+cvs.width = W; cvs.height = H;
+cvs.tabIndex = 0; // lets the game take keyboard focus when it sits inside another page
+const ctx = cvs.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+const shCvs = document.createElement('canvas'); shCvs.width = W; shCvs.height = H;
+const shg = shCvs.getContext('2d'); shg.imageSmoothingEnabled = false;
+
+// ================= palette (4 greys) =================
+const PALS = {
+  day:   ['#e2e2d8', '#a4a49a', '#585852', '#181816'],
+  night: ['#9a9a92', '#66665f', '#363632', '#0d0d0c'],
+};
+let P = PALS.day, PRGB = [];
+const spriteCache = {}, glyphCache = {};
+let ditherPat = null;
+function hexRgb(h) { return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)]; }
+function setPalette(k) {
+  P = PALS[k]; PRGB = P.map(hexRgb);
+  for (const a in spriteCache) delete spriteCache[a];
+  for (const a in glyphCache) delete glyphCache[a];
+  const c = document.createElement('canvas'); c.width = 2; c.height = 2;
+  const g = c.getContext('2d'); g.fillStyle = P[3]; g.fillRect(0, 0, 1, 1); g.fillRect(1, 1, 1, 1);
+  ditherPat = shg.createPattern(c, 'repeat');
+}
+
+// ================= helpers =================
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < .5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+function hash(x, y, s) { let h = (x * 374761393 + y * 668265263 + s * 1442695041) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function rect(x, y, w, h, c) { ctx.fillStyle = P[c]; ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h)); }
+function px(x, y, c) { ctx.fillStyle = P[c]; ctx.fillRect(Math.round(x), Math.round(y), 1, 1); }
+function disc(cx, cy, r, c) {
+  ctx.fillStyle = P[c]; cx = Math.round(cx); cy = Math.round(cy);
+  for (let y = -r; y <= r; y++) { const w = Math.floor(Math.sqrt(r * r - y * y + r * .8)); ctx.fillRect(cx - w, cy + y, w * 2 + 1, 1); }
+}
+function thickLine(x0, y0, x1, y1, r, c) {
+  const n = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0)));
+  for (let i = 0; i <= n; i++) { const t = i / n; disc(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, r, c); }
+}
+function angDev(a) { a = ((a % Math.PI) + Math.PI) % Math.PI; return Math.min(a, Math.PI - a); }
+
+// ================= sprites =================
+const SPR = {};
+function defA(key, rows) {
+  const h = rows.length, w = Math.max(...rows.map(r => r.length));
+  const d = new Int8Array(w * h).fill(-1);
+  rows.forEach((r, y) => { for (let x = 0; x < r.length; x++) { const c = r.charCodeAt(x) - 48; if (c >= 0 && c <= 3) d[y * w + x] = c; } });
+  SPR[key] = { w, h, d };
+}
+function defP(key, w, h, fn) {
+  const d = new Int8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) d[y * w + x] = fn(x, y);
+  SPR[key] = { w, h, d };
+}
+function spr(key, mode) {
+  const ck = key + '|' + mode; let c = spriteCache[ck]; if (c) return c;
+  const s = SPR[key]; c = document.createElement('canvas'); c.width = s.w; c.height = s.h;
+  const g = c.getContext('2d'); const im = g.createImageData(s.w, s.h);
+  for (let i = 0; i < s.d.length; i++) {
+    const v = s.d[i]; if (v < 0) continue;
+    const idx = mode === 'n' ? v : mode === 'inv' ? 3 - v : +mode;
+    const rgb = PRGB[idx];
+    im.data[i * 4] = rgb[0]; im.data[i * 4 + 1] = rgb[1]; im.data[i * 4 + 2] = rgb[2]; im.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(im, 0, 0); spriteCache[ck] = c; return c;
+}
+function drawSpr(key, mode, x, y, ang, sx, sy, g) {
+  g = g || ctx; const c = spr(key, mode);
+  g.save(); g.translate(Math.round(x), Math.round(y));
+  if (ang) g.rotate(ang);
+  if ((sx && sx !== 1) || (sy && sy !== 1)) g.scale(sx || 1, sy || 1);
+  g.drawImage(c, -(c.width >> 1), -(c.height >> 1));
+  g.restore();
+}
+
+function genSprites() {
+  // --- products ---
+  const punnet = alt => (x, y) => {
+    if (x === 0 || y === 0 || x === 13 || y === 9) return 3;
+    if (x === 1 || y === 1 || x === 12 || y === 8) return 0;
+    const bx = (x - 2 + (y > 4 ? 1 : 0)) % 3, by = (y - 2) % 3;
+    if (bx < 2 && by < 2) return (bx === 0 && by === 0) ? (alt ? 1 : 0) : (alt ? 3 : 2);
+    return 1;
+  };
+  defP('strawb', 14, 10, punnet(false)); defP('strawb_alt', 14, 10, punnet(true));
+  defP('box', 18, 14, (x, y) => { if (x === 0 || y === 0 || x === 17 || y === 13) return 3; if (x === 8 || x === 9) return 0; if (y === 6 || y === 7) return 2; if ((x === 2 || x === 15) && (y === 2 || y === 11)) return 2; return 1; });
+  defP('box_alt', 18, 14, (x, y) => { if (x === 0 || y === 0 || x === 17 || y === 13) return 3; if (y === 6 || y === 7) return 0; if (x === 8 || x === 9) return 2; if ((x === 2 || x === 15) && (y === 2 || y === 11)) return 2; return 1; });
+  const salad = alt => (x, y) => {
+    const ex = x === 0 || x === 15, ey = y === 0 || y === 11;
+    if (ex && ey) return -1;
+    if (x <= 1 || x >= 14) return (y % 2) ? 2 : 3;
+    if (ey) return 3;
+    if (x >= 6 && x <= 9 && y >= 4 && y <= 7) return (y === 5 && x > 6 && x < 9) ? 0 : 2;
+    const h = hash(x, y, 3); return alt ? (h < .6 ? 2 : 1) : (h < .45 ? 1 : 0);
+  };
+  defP('salad', 16, 12, salad(false)); defP('salad_alt', 16, 12, salad(true));
+  const eggs = alt => (x, y) => {
+    if (x === 0 || y === 0 || x === 15 || y === 9) return 3;
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 2; j++) {
+      const ex = 3.1 + i * 4.9, ey = 2.7 + j * 4.5;
+      if (Math.hypot((x - ex) / 1.8, (y - ey) / 1.6) < 1) return (alt && i === 1 && j === 1) ? 1 : 0;
+    }
+    return 2;
+  };
+  defP('eggs', 16, 10, eggs(false)); defP('eggs_alt', 16, 10, eggs(true));
+  const mush = alt => (x, y) => {
+    if (x === 0 || y === 0 || x === 10 || y === 8) return 3;
+    const C = [[3, 2.5], [7.2, 2.5], [2.8, 6], [7.5, 6], [5.2, 4.3]];
+    for (const [cx, cy] of C) { const d = Math.hypot(x - cx, y - cy); if (d < 1.3) return alt ? 1 : 0; if (d < 1.9) return alt ? 2 : 1; }
+    return 2;
+  };
+  defP('mush', 11, 9, mush(false)); defP('mush_alt', 11, 9, mush(true));
+  for (const s of Object.values(SKUS)) {
+    defP('crack_' + s.id, s.w, s.h, (x, y) => {
+      const cy = s.h / 2 + Math.sin(x * 1.7 + s.w) * 1.6;
+      if (x > 1 && x < s.w - 2 && Math.abs(y - cy) < .6) return 3;
+      if (x > 0 && y > 0 && x < s.w - 1 && y < s.h - 1 && hash(x, y, 9) < .06) return 0;
+      return -1;
+    });
+  }
+  // --- things that should not be on the line ---
+  defA('boombox', [
+    '....33333333333333....',
+    '....3............3....',
+    '3333333333333333333333',
+    '3111111111111111111113',
+    '3133331222222221333313',
+    '3132231200000021322313',
+    '3132231200000021322313',
+    '3133331222222221333313',
+    '3111111111111111111113',
+    '3110101011111110101013',
+    '3111111111111111111113',
+    '3333333333333333333333']);
+  defA('bat', [
+    '.'.repeat(10) + '3'.repeat(20),
+    '3'.repeat(10) + '3' + '1'.repeat(18) + '3',
+    '3232323232' + '3' + '1'.repeat(7) + '0000' + '1'.repeat(7) + '3',
+    '3'.repeat(10) + '3' + '1'.repeat(18) + '3',
+    '.'.repeat(10) + '3'.repeat(20)]);
+  defA('cat', [
+    '.3...3..........',
+    '3233323.........',
+    '3222223333333...',
+    '3020203222222233',
+    '3221223222222223',
+    '3222223212121223',
+    '.333332121212123',
+    '......3222222223',
+    '......3333333323',
+    '...........3223.',
+    '............33..']);
+  defA('chicken', [
+    '...22.......',
+    '..3003......',
+    '..30303.....',
+    '.113003.....',
+    '...3003.333.',
+    '...300033003',
+    '..3000000003',
+    '..3001100003',
+    '..3000110003',
+    '...30000003.',
+    '....333333..',
+    '.....1..1...']);
+  defA('sock', [
+    '.3333...', '.3223...', '.3003...', '.3113...', '.3113...', '.3113...',
+    '.3113...', '.31133..', '.311113.', '.3111103', '..33333.']);
+  defA('bone', [
+    '.33..........33.',
+    '3003333333333003',
+    '.30000000000003.',
+    '3003333333333003',
+    '.33..........33.']);
+  defP('brick', 14, 7, (x, y) => { if (x === 0 || y === 0 || x === 13 || y === 6) return 3; if (y === 3) return 2; if ((y < 3 && x === 7) || (y > 3 && (x === 3 || x === 10))) return 2; return 1; });
+  defP('lorry', 30, 13, (x, y) => {
+    for (const wx of [4, 9, 18, 26]) if (Math.hypot(x - wx, y - 11) < 1.6) return (x === wx && y === 11) ? 1 : 3;
+    if (y === 9) return 3;
+    if (x <= 20 && y <= 8) { if (x === 0 || y === 0 || x === 20 || y === 8) return 3; return y === 4 ? 1 : 0; }
+    if (x >= 22 && y >= 2 && y <= 8) { if (x === 22 || y === 2 || x === 29 || y === 8) return 3; if (x >= 24 && x <= 28 && y >= 3 && y <= 5) return 2; return 1; }
+    return -1;
+  });
+}
+
+// ================= font (3x5) =================
+const FONT = {
+  '0': '111101101101111', '1': '010110010010111', '2': '111001111100111', '3': '111001111001111', '4': '101101111001001',
+  '5': '111100111001111', '6': '111100111101111', '7': '111001001010010', '8': '111101111101111', '9': '111101111001111',
+  A: '010101111101101', B: '110101110101110', C: '011100100100011', D: '110101101101110', E: '111100110100111',
+  F: '111100110100100', G: '011100101101011', H: '101101111101101', I: '111010010010111', J: '001001001101010',
+  K: '101101110101101', L: '100100100100111', M: '101111111101101', N: '110101101101101', O: '010101101101010',
+  P: '110101110100100', Q: '010101101110011', R: '110101110101101', S: '011100010001110', T: '111010010010010',
+  U: '101101101101111', V: '101101101101010', W: '101101111111101', X: '101101010101101', Y: '101101010010010',
+  Z: '111001010100111', '.': '000000000000010', ':': '000010000010000', '!': '010010010000010', '-': '000000111000000',
+  '+': '000010111010000', '/': '001001010100100', '?': '111001010000010', ',': '000000000010100', '%': '101001010100101',
+  '<': '001010100010001', '>': '100010001010100', '^': '000010111000000', '~': '000111010000000',
+};
+function glyph(ch, c) {
+  const k = ch + c; let g = glyphCache[k]; if (g) return g;
+  const bits = FONT[ch] || FONT['?'];
+  g = document.createElement('canvas'); g.width = 3; g.height = 5;
+  const gg = g.getContext('2d'); gg.fillStyle = P[c];
+  for (let i = 0; i < 15; i++) if (bits[i] === '1') gg.fillRect(i % 3, (i / 3) | 0, 1, 1);
+  glyphCache[k] = g; return g;
+}
+function text(s, x, y, c, align, sc) {
+  s = String(s).toUpperCase(); sc = sc || 1; c = c === undefined ? 0 : c;
+  const w = (s.length * 4 - 1) * sc;
+  if (align === 'center') x -= w / 2; else if (align === 'right') x -= w;
+  x = Math.round(x); y = Math.round(y);
+  for (let i = 0; i < s.length; i++) if (s[i] !== ' ') ctx.drawImage(glyph(s[i], c), x + i * 4 * sc, y, 3 * sc, 5 * sc);
+}
+const pad = (n, l) => String(Math.max(0, Math.floor(n))).padStart(l, '0');
+
+// ================= layout & tuning =================
+const BELT_X0 = 40, BELT_X1 = 302, BELT_Y0 = 112, BELT_Y1 = 150, BELT_CY = 131;
+const GATE_X = 268, JOINT_X = 150, SPAWN_X = 20;
+const TRAY_X = 172, TRAY_Y = 18, TRAY_SLOTS = 4;
+const SHOULDER = { x: 140, y: 72 }, L1 = 72, L2 = 72;
+const HOME = { x: 228, y: 102, z: 18 }, RACK = { x: 108, y: 100, z: 8 };
+const TRAYS_PER_PALLET = 8, PALLETS_PER_LORRY = 4, MAX_STRIKES = 3;
+const PPM_START = 50, PPM_RATE = 0.45, PPM_MAX = 150;
+const SHIFT_LEN = 180, SHIFTS = ['DAY', 'LATE', 'NIGHT'];
+const WASTE_PENALTY = 5, SNAP = 0.26, SEAL = 0.6;
+
+const SKUS = {
+  strawb: { id: 'strawb', name: 'STRAWBS', key: 'strawb', w: 14, h: 10, n: 4, density: .0012, friction: .3, grip: 1, fragility: .7, soft: .25, height: 3 },
+  box:    { id: 'box', name: 'BOXES', key: 'box', w: 18, h: 14, n: 2, density: .003, friction: .2, grip: .8, fragility: .3, soft: .05, height: 5 },
+  salad:  { id: 'salad', name: 'SALAD', key: 'salad', w: 16, h: 12, n: 3, density: .0007, friction: .55, grip: 1.2, fragility: .25, soft: .8, height: 3 },
+  eggs:   { id: 'eggs', name: 'EGGS', key: 'eggs', w: 16, h: 10, n: 3, density: .0014, friction: .3, grip: 1, fragility: 1.5, soft: .1, height: 3 },
+  mush:   { id: 'mush', name: 'MUSHROOMS', key: 'mush', w: 11, h: 9, n: 5, density: .001, friction: .35, grip: 1, fragility: .8, soft: .25, height: 3 },
+};
+const SKU_ORDER = ['strawb', 'box', 'salad', 'eggs', 'mush', 'strawb'];
+const FOREIGN = [
+  { key: 'boombox', w: 22, h: 12, density: .004, friction: .35, height: 5, unlock: 0 },
+  { key: 'bat', w: 30, h: 5, density: .0018, friction: .2, height: 2, unlock: 0 },
+  { key: 'cat', w: 16, h: 11, density: .005, friction: .9, height: 4, unlock: 0, chamfer: 3 },
+  { key: 'chicken', w: 12, h: 12, density: .0015, friction: .3, height: 4, unlock: 45, circle: true, wander: true },
+  { key: 'brick', w: 14, h: 7, density: .006, friction: .6, height: 4, unlock: 45 },
+  { key: 'sock', w: 8, h: 11, density: .0006, friction: .6, height: 1, unlock: 45 },
+  { key: 'bone', w: 16, h: 5, density: .002, friction: .3, height: 2, unlock: 110 },
+];
+
+// ================= physics =================
+const engine = Engine.create({ gravity: { x: 0, y: 0, scale: 0 } });
+engine.positionIterations = 10; engine.velocityIterations = 8;
+const world = engine.world;
+let items = [], railBodies = [], railTop = [], railBot = [];
+const gateBody = Bodies.rectangle(GATE_X, BELT_CY, 5, BELT_Y1 - BELT_Y0 + 8, { isStatic: true, label: 'gate', friction: .1 });
+Composite.add(world, gateBody);
+
+function seg(x1, y1, x2, y2) {
+  const t = 3, len = Math.hypot(x2 - x1, y2 - y1);
+  return Bodies.rectangle((x1 + x2) / 2, (y1 + y2) / 2, len + t, t, { isStatic: true, angle: Math.atan2(y2 - y1, x2 - x1), friction: 0, label: 'rail' });
+}
+function buildRails(laneHalf) {
+  Composite.remove(world, railBodies);
+  const top = BELT_CY - laneHalf - 1.5, bot = BELT_CY + laneHalf + 1.5;
+  // straight single-lane guides, with one slightly proud rail joint that loves to catch a corner
+  // guides stop just short of the gate; nothing beyond it
+  railTop = [[0, top], [JOINT_X, top], [JOINT_X + 3, top + 1.5], [JOINT_X + 8, top + 1.5], [JOINT_X + 11, top], [GATE_X - 8, top]];
+  railBot = [[0, bot], [GATE_X - 8, bot]];
+  railBodies = [];
+  for (const r of [railTop, railBot]) for (let i = 0; i < r.length - 1; i++) railBodies.push(seg(r[i][0], r[i][1], r[i + 1][0], r[i + 1][1]));
+  Composite.add(world, railBodies);
+}
+function removeBody(b) { Composite.remove(world, b); const i = items.indexOf(b); if (i >= 0) items.splice(i, 1); }
+function clearItems() { for (const b of items.slice()) Composite.remove(world, b); items = []; }
+
+Events.on(engine, 'collisionStart', ev => {
+  for (const pr of ev.pairs) { const a = pr.bodyA.parent, b = pr.bodyB.parent; impact(a, b); impact(b, a); }
+});
+function impact(a, b) {
+  const it = a.plugin && a.plugin.item; if (!it) return;
+  if (b.isStatic && b.label !== 'gate') return;
+  const rv = Math.hypot(a.velocity.x - b.velocity.x, a.velocity.y - b.velocity.y);
+  const mb = b.isStatic ? a.mass * 3 : b.mass;
+  const imp = rv * 2 * mb / (a.mass + mb);
+  const thr = beltV * 1.15 + .35;
+  if (imp > thr) it.damage += (imp - thr) * it.fragility * 1.3;
+  it.squash = Math.min(1, it.squash + imp * it.soft * .8);
+}
+
+// ================= game state =================
+let state = 'title', stateT = 0, time = 0;
+let sku = SKUS.strawb, laserX = 0;
+let ppm = PPM_START, peak = PPM_START, beltV = 0, beltOff = 0, runT = 0;
+// the belt runs in fixed speed settings, stepping up every 20 PPM; spawn rate rises smoothly in between
+let beltSet = 0, beltSpeed = 0;
+function beltSpeedFor(p) { return 22 + Math.floor((p - 30) / 20) * 9; }
+let score = 0, strikes = 0, lorries = 0, pallets = 0, traysInPallet = 0, palletPts = 0, waste = 0;
+let best = 0;
+try { best = +(window.localStorage.getItem('gatekeeper_best') || 0) || 0; } catch (e) { best = 0; }
+let stats = {}, shiftStats = {};
+let shiftIdx = 0, shiftT = 0, coDone = false, pendingCO = false, pendingEnd = false, skuSeq = 0, co = null;
+let tray = null, nextSpawn = 0, stallT = 0;
+let gateOpen = false, gateAnim = 0, shake = 0, laserFlash = 0, palletFlash = 0, lorryAnim = -1;
+let floats = [], banner = null, pile = [];
+let muted = false, armed = false, portrait = false;
+const keys = new Set(), pointers = new Set();
+const held = () => keys.size > 0 || pointers.size > 0;
+
+function freshShiftStats() { return { trays: 0, bad: 0, waste: 0, peak: ppm, pallets: 0 }; }
+function float(t, x, y, c) { floats.push({ t, x, y, c: c === undefined ? 0 : c, age: 0 }); }
+function showBanner(a, b, life) { banner = { a, b, t: 0, life }; }
+
+function applySku(s) {
+  sku = s; buildRails(s.h / 2 + 3);
+  laserX = GATE_X - 2.5 - s.n * s.w + s.w * .5;
+  robot.n = s.n; robot.w = s.w; robot.h = s.height;
+}
+function nextSku() {
+  skuSeq++;
+  if (skuSeq < SKU_ORDER.length) return SKUS[SKU_ORDER[skuSeq]];
+  const ids = Object.keys(SKUS).filter(k => k !== sku.id);
+  return SKUS[ids[(Math.random() * ids.length) | 0]];
+}
+
+function resetGame() {
+  clearItems(); setPalette('day');
+  score = 0; strikes = 0; lorries = 0; pallets = 0; traysInPallet = 0; palletPts = 0; waste = 0;
+  ppm = PPM_START; peak = ppm; runT = 0; beltSet = beltSpeedFor(PPM_START); shiftIdx = 0; shiftT = 0; coDone = false; pendingCO = false; pendingEnd = false; skuSeq = 0;
+  stats = { trays: 0, pallets: 0, lorries: 0, waste: 0 }; shiftStats = freshShiftStats();
+  robot.moves = []; robot.cur = null; robot.carried = []; robot.busy = false;
+  robot.x = HOME.x; robot.y = HOME.y; robot.z = HOME.z;
+  applySku(SKUS.strawb); newTray();
+  pile = []; floats = []; lorryAnim = -1; nextSpawn = .8; stallT = 0;
+  forceGate(false);
+  state = 'play'; stateT = 0; armed = false; entry = null;
+  showBanner('DAY SHIFT', 'STRAWBS X4', 2);
+}
+
+// ================= spawning =================
+let sinceBad = 99;
+function spawn() {
+  for (const b of items) if (b.bounds.min.x < SPAWN_X + 18) { nextSpawn = .06; return; }
+  let def = sku, kind = 'product', wrong = false, crushed = false;
+  const fc = .1 + Math.min(.12, runT / 1500);
+  // keep at least a batch-worth of good packs between unwanted things, bar the odd surprise
+  const roomy = sinceBad >= sku.n || Math.random() < .25;
+  if (roomy && Math.random() < fc) {
+    const pool = FOREIGN.filter(f => runT >= f.unlock);
+    def = pool[(Math.random() * pool.length) | 0]; kind = 'foreign';
+  } else if (roomy && runT >= 110 && Math.random() < .08) {
+    if (Math.random() < .55) wrong = true; else crushed = true;
+  }
+  sinceBad = (kind === 'foreign' || wrong || crushed) ? 0 : sinceBad + 1;
+  makeItem(def, kind, wrong, crushed);
+  const mean = 60 / ppm, r = Math.random();
+  nextSpawn = r < .3 ? mean * rnd(.2, .5) : r < .9 ? mean * rnd(.8, 1.6) : mean * rnd(2, 3.2);
+}
+function makeItem(def, kind, wrong, crushed) {
+  const laneHalf = sku.h / 2 + 3;
+  const x = SPAWN_X, y = BELT_CY + rnd(-1, 1) * Math.max(0, laneHalf - def.h / 2 - 1.5);
+  const opts = { density: def.density, friction: def.friction, frictionStatic: def.friction * 1.5, frictionAir: 0, restitution: .05, slop: .02, label: 'item' };
+  const b = def.circle ? Bodies.circle(x, y, Math.min(def.w, def.h) / 2, opts)
+    : Bodies.rectangle(x, y, def.w, def.h, Object.assign({ chamfer: { radius: def.chamfer || 1 } }, opts));
+  Body.setAngle(b, kind !== 'product' ? rnd(-.08, .08) : Math.random() < .08 ? rnd(.35, .75) * (Math.random() < .5 ? -1 : 1) : rnd(-.15, .15));
+  Body.setVelocity(b, { x: beltV, y: 0 });
+  b.plugin.item = {
+    kind, wrong, key: wrong ? def.key + '_alt' : def.key, height: def.height,
+    damage: crushed ? 1 : 0, squash: 0, stuck: 0,
+    grip: def.grip || 1, fragility: def.fragility === undefined ? .3 : def.fragility, soft: def.soft === undefined ? .1 : def.soft,
+    wander: !!def.wander, crack: 'crack_' + (def.id || 'none'),
+  };
+  Composite.add(world, b); items.push(b);
+}
+
+// ================= belt =================
+function queueSet() {
+  // packs touching a chain that runs back from the closed gate count as queued
+  const q = new Set(); if (gateOpen) return q;
+  const sorted = items.slice().sort((a, b) => b.position.x - a.position.x);
+  let front = GATE_X - 2.5;
+  for (const b of sorted) {
+    if (b.bounds.max.x >= front - 2.5) { q.add(b); front = Math.min(front, b.bounds.min.x); }
+  }
+  return q;
+}
+function driveBelt(dt) {
+  const queued = queueSet();
+  for (const b of items.slice()) {
+    const p = b.position, it = b.plugin.item;
+    if (p.x > BELT_X1 + 3 || p.y < BELT_Y0 - 14 || p.y > BELT_Y1 + 14) { toWaste(b); continue; }
+    const g = Math.min(.5, .12 * it.grip);
+    let vx = b.velocity.x + (beltV - b.velocity.x) * g, vy = b.velocity.y * (1 - .1 * it.grip);
+    if (it.wander && Math.random() < .025) { vx += rnd(-.5, .5); vy += rnd(-.7, .7); Body.setAngularVelocity(b, rnd(-.15, .15)); }
+    // anything stalled that is not part of the queue backed up from the gate is wedged: rattle it loose
+    if (!queued.has(b) && Math.abs(b.velocity.x) < beltV * .25) it.stuck += dt; else it.stuck = 0;
+    if (it.stuck > .8) {
+      it.stuck = 0;
+      // two packs jammed side by side: the one further back gives way
+      const beside = items.find(o => o !== b && !queued.has(o) && o.position.x >= p.x - 1 &&
+        o.bounds.min.x < b.bounds.max.x && o.bounds.max.x > b.bounds.min.x);
+      if (beside) { vx = -beltV * 2.5; vy = (p.y < beside.position.y ? -1 : 1) * .3; }
+      else {
+        const a0 = b.angle - Math.PI * Math.round(b.angle / Math.PI);
+        Body.setAngle(b, b.angle - a0 * .5); vx = beltV * 1.6; vy = (BELT_CY - p.y) * .08;
+      }
+    }
+    Body.setVelocity(b, { x: vx, y: vy });
+    let av = b.angularVelocity * .9;
+    // guide rails gently square up packs that are running freely; queued packs stay as they are
+    if (p.x > 50 && b.velocity.x > beltV * .5) av -= Math.sin(2 * b.angle) * .0015 * clamp(1.4 - ppm / 150, .4, 1);
+    Body.setAngularVelocity(b, av);
+    it.squash *= .9;
+  }
+}
+function toWaste(b) {
+  removeBody(b);
+  const it = b.plugin.item;
+  pile.push({ key: it.key, x: rnd(307, 318), y: BELT_Y0 + 54 - Math.min(46, pile.length * 1.3) + rnd(-2, 2), a: rnd(0, 6.28) });
+  if (pile.length > 40) pile.shift();
+  if (it.key === 'cat') { SFX.meow(false); float('MEOW', 300, 92, 3); }
+}
+// Rejects are judged as they cross the gate line, not when they land in the bin.
+// Good packs dumped while the gate is up are held as 'pending'. If a bad item follows
+// them through in the same lift, they were the necessary price of reaching it and are
+// forgiven. Whatever is still pending when the gate drops was dumped for nothing.
+let pendingDump = [];
+function isBadPack(b) { const it = b.plugin.item; return it.kind !== 'product' || it.wrong || it.damage >= 1 || angDev(b.angle) > SNAP; }
+function penalise(n) {
+  if (!n) return;
+  score = Math.max(0, score - WASTE_PENALTY * n); waste += n; stats.waste += n; shiftStats.waste += n;
+  float('-' + WASTE_PENALTY * n, 292, 100, 3); SFX.waste();
+}
+function checkCrossings() {
+  if (state !== 'play') { pendingDump.length = 0; return; }
+  for (const b of items) {
+    const it = b.plugin.item;
+    if (it.passed || b.position.x < GATE_X + 3) continue;
+    it.passed = true;
+    if (isBadPack(b)) {
+      if (pendingDump.length) float('SAVED ' + pendingDump.length, GATE_X, BELT_Y0 - 16, 3);
+      pendingDump.length = 0; float('NICE', 292, 100, 3); SFX.nice();
+    } else if (gateOpen) pendingDump.push(it);
+    else penalise(1);
+  }
+}
+
+// ================= gate =================
+function forceGate(open) {
+  gateOpen = open; gateAnim = open ? 1 : 0;
+  gateBody.collisionFilter.mask = open ? 0 : 0xFFFFFFFF;
+}
+function setGate(open) {
+  if (open === gateOpen) return;
+  gateOpen = open;
+  if (open) { gateBody.collisionFilter.mask = 0; SFX.up(); }
+  else { gateBody.collisionFilter.mask = 0xFFFFFFFF; swat(); SFX.down(); shake = .06; if (state === 'play') penalise(pendingDump.length); pendingDump.length = 0; }
+}
+function swat() {
+  for (const b of items) {
+    if (b.bounds.max.x > GATE_X - 2.5 && b.bounds.min.x < GATE_X + 2.5) {
+      const dir = b.position.x < GATE_X ? -1 : 1;
+      Body.setPosition(b, { x: b.position.x + dir * 2, y: b.position.y });
+      Body.setVelocity(b, { x: dir * rnd(.8, 1.6), y: rnd(-.8, .8) });
+      Body.setAngularVelocity(b, rnd(-.25, .25));
+      const it = b.plugin.item; it.damage += .35 * it.fragility + .1; it.squash = 1;
+      if (it.key === 'cat') { SFX.meow(true); float('MRAOW', b.position.x, b.position.y - 16, 0); }
+    }
+  }
+}
+
+// ================= laser + robot =================
+const robot = { x: HOME.x, y: HOME.y, z: HOME.z, moves: [], cur: null, carried: [], busy: false, n: 4, w: 14, h: 3, swapT: 0 };
+function rmove(x, y, z, dur, fn) { robot.moves.push({ x, y, z, dur, fn }); robot.busy = true; }
+function robotScale() { return clamp(1.25 - (ppm - PPM_START) / 140, .5, 1.25); }
+function updateRobot(dt) {
+  if (!robot.cur && robot.moves.length) { const m = robot.moves.shift(); robot.cur = Object.assign({ fx: robot.x, fy: robot.y, fz: robot.z, t: 0 }, m); }
+  const c = robot.cur;
+  if (c) {
+    c.t += dt / (c.dur * robotScale());
+    const k = ease(Math.min(1, c.t));
+    robot.x = lerp(c.fx, c.x, k); robot.y = lerp(c.fy, c.y, k); robot.z = lerp(c.fz, c.z, k);
+    if (c.t >= 1) { robot.cur = null; if (c.fn) c.fn(); }
+  }
+  robot.busy = !!robot.cur || robot.moves.length > 0;
+  if (robot.swapT > 0) robot.swapT -= dt;
+}
+function zoneItems() {
+  const lo = laserX - sku.w * .45;
+  return items.filter(b => {
+    const p = b.position;
+    return p.y > BELT_Y0 - 2 && p.y < BELT_Y1 + 2 && p.x < GATE_X &&
+      (p.x > lo || (b.bounds.min.x <= laserX && b.bounds.max.x >= laserX));
+  });
+}
+function checkTrigger(dt) {
+  if (robot.busy || !tray || tray.state !== 'ready' || gateOpen) { stallT = 0; return; }
+  let stalled = false;
+  for (const b of items) {
+    if (b.bounds.min.x <= laserX && b.bounds.max.x >= laserX && b.position.y > BELT_Y0 && b.position.y < BELT_Y1 &&
+      Math.abs(b.velocity.x) < beltV * .35) { stalled = true; break; }
+  }
+  stallT = stalled ? stallT + dt : 0;
+  if (stallT > .22) { stallT = 0; startPick(); }
+}
+function startPick() {
+  const z = zoneItems(); if (!z.length) return;
+  let cx = 0; for (const b of z) cx += b.position.x; cx /= z.length;
+  laserFlash = .15; SFX.laser();
+  rmove(cx, BELT_CY, 10, .26);
+  rmove(cx, BELT_CY, 0, .1, () => attach(cx, BELT_CY));
+}
+function attach(cx, cy) {
+  const z = zoneItems();
+  if (!z.length || !tray) { rmove(HOME.x, HOME.y, HOME.z, .22); return; }
+  SFX.suck();
+  const drops = []; robot.carried = [];
+  for (const b of z) {
+    const it = b.plugin.item, dev = angDev(b.angle);
+    const c = { dx: b.position.x - cx, dy: b.position.y - cy, ang: b.angle, dev, it, body: b };
+    removeBody(b); robot.carried.push(c);
+    if (it.kind === 'product' && dev > SEAL) drops.push(c); // cup can't seal on a twisted pack
+  }
+  rmove(cx, cy, 12, .12, () => {
+    if (!drops.length) return;
+    SFX.drop();
+    for (const d of drops) {
+      const i = robot.carried.indexOf(d); if (i >= 0) robot.carried.splice(i, 1);
+      const b = d.body;
+      Body.setPosition(b, { x: cx + d.dx, y: cy + d.dy });
+      Body.setVelocity(b, { x: rnd(-.3, .3), y: rnd(-.4, .4) });
+      Body.setAngularVelocity(b, rnd(-.2, .2));
+      d.it.damage += .3 * d.it.fragility; d.it.squash = 1;
+      Composite.add(world, b); items.push(b);
+    }
+    float('DROP', cx, cy - 26, 3);
+  });
+  const s = slotPos(tray.filled);
+  rmove(s.x, s.y, 12, .28);
+  rmove(s.x, s.y, 0, .1, place);
+  rmove(s.x, s.y, 10, .08);
+  rmove(HOME.x, HOME.y, HOME.z, .22);
+}
+function place() {
+  if (!tray || !tray.slots[tray.filled]) { robot.carried = []; return; }
+  const slot = tray.slots[tray.filled], N = sku.n;
+  const list = robot.carried.slice().sort((a, b) => a.dx - b.dx); robot.carried = [];
+  let good = list.length === N; const placed = [];
+  list.forEach((c, i) => {
+    const it = c.it;
+    const fits = it.kind === 'product' && c.dev <= SNAP && i < N && list.length <= N;
+    if (!(fits && !it.wrong && it.damage < 1)) good = false;
+    if (fits) placed.push({ it, x: (i - (N - 1) / 2) * sku.w, y: 0, ang: 0 });
+    else placed.push({ it, x: c.dx, y: c.dy, ang: c.ang });
+  });
+  slot.items = placed; slot.good = good; slot.flash = .3; tray.filled++;
+  if (good) SFX.snap(); else SFX.clunk();
+  if (tray.filled >= TRAY_SLOTS) judgeTray();
+}
+
+// ================= tray =================
+function trayGeom() { const rowH = sku.h + 5, w = sku.n * sku.w + 8; return { x: TRAY_X, y: TRAY_Y, w, h: rowH * TRAY_SLOTS + 6, rowH }; }
+function slotPos(i) { const g = trayGeom(); return { x: g.x + g.w / 2, y: g.y + 3 + g.rowH * i + (g.rowH - 2) / 2 + sku.height }; }
+function newTray() {
+  tray = { state: 'in', t: 0, filled: 0, value: TRAY_SLOTS * sku.n * 10, slots: Array.from({ length: TRAY_SLOTS }, () => ({ items: [], good: null, flash: 0 })) };
+  SFX.slide();
+}
+function judgeTray() {
+  const ok = tray.slots.every(s => s.good);
+  tray.state = ok ? 'flash' : 'cross'; tray.t = 0;
+  if (ok) SFX.good(); else SFX.bad();
+}
+function updateTray(dt) {
+  if (!tray) return;
+  tray.t += dt;
+  for (const s of tray.slots) if (s.flash > 0) s.flash -= dt;
+  switch (tray.state) {
+    case 'in': if (tray.t >= .45) { tray.state = 'ready'; tray.t = 0; } break;
+    case 'flash': if (tray.t >= .7) { tray.state = 'dissolve'; tray.t = 0; SFX.whoosh(); } break;
+    case 'dissolve': if (tray.t >= .45) goodTrayDone(); break;
+    case 'cross': if (tray.t >= .8) { tray.state = 'trap'; tray.t = 0; SFX.trap(); } break;
+    case 'trap': if (tray.t >= .45) badTrayDone(); break;
+  }
+}
+function goodTrayDone() {
+  const v = tray.value;
+  score += v; palletPts += v; traysInPallet++; stats.trays++; shiftStats.trays++;
+  float('+' + v, TRAY_X + 32, TRAY_Y + 30, 3);
+  if (traysInPallet >= TRAYS_PER_PALLET) {
+    traysInPallet = 0; palletPts = 0; pallets++; stats.pallets++; shiftStats.pallets++;
+    score += 500; palletFlash = 1.2; SFX.pallet(); float('+500', 19, 84, 0);
+    if (pallets >= PALLETS_PER_LORRY) {
+      pallets = 0; lorries++; stats.lorries++; score += 2500; lorryAnim = 0; SFX.lorry(); float('LORRY +2500', 160, 156, 3);
+    }
+  }
+  afterTray();
+}
+function badTrayDone() {
+  strikes++; shiftStats.bad++;
+  float('STRIKE ' + strikes, TRAY_X + 32, TRAY_Y + 40, 3);
+  if (strikes >= MAX_STRIKES) { tray = null; gameOver(); return; }
+  afterTray();
+}
+function afterTray() { if (pendingEnd || pendingCO) doPending(); else newTray(); }
+function tryPending() {
+  if ((pendingCO || pendingEnd) && tray && tray.state === 'ready' && tray.filled === 0 && !robot.busy) doPending();
+}
+function doPending() {
+  tray = null;
+  if (pendingEnd) { pendingEnd = false; pendingCO = false; enterShiftEnd(); }
+  else { pendingCO = false; startChangeover(nextSku(), 'SKU CHANGEOVER'); }
+}
+
+// ================= shifts & changeovers =================
+function startChangeover(next, title) {
+  state = 'changeover'; stateT = 0; co = { t: 0, next }; tray = null;
+  showBanner(title, 'NEXT ' + next.name + ' X' + next.n, 2.6);
+  rmove(RACK.x, RACK.y, RACK.z, .45);
+  rmove(RACK.x, RACK.y, RACK.z + 6, .35, () => { robot.n = next.n; robot.w = next.w; robot.h = next.height; robot.swapT = .5; SFX.swap(); });
+  rmove(HOME.x, HOME.y, HOME.z, .45);
+  SFX.chime();
+}
+function updateChangeover(dt) {
+  co.t += dt;
+  if (co.t > 2.2 && !robot.busy && (items.length === 0 || co.t > 6)) {
+    clearItems(); applySku(co.next); newTray();
+    state = 'play'; stateT = 0; nextSpawn = .4;
+  }
+}
+function enterShiftEnd() {
+  state = 'shiftEnd'; stateT = 0; clearItems(); forceGate(false);
+  robot.moves = []; robot.cur = null; robot.carried = []; rmove(HOME.x, HOME.y, HOME.z, .4);
+  SFX.chime();
+}
+function nextShift() {
+  shiftIdx++;
+  setPalette(SHIFTS[shiftIdx % 3] === 'NIGHT' ? 'night' : 'day');
+  shiftT = 0; coDone = false; shiftStats = freshShiftStats(); armed = false;
+  startChangeover(nextSku(), SHIFTS[shiftIdx % 3] + ' SHIFT');
+}
+function gameOver() {
+  state = 'over'; stateT = 0; forceGate(false);
+  if (score > best) { best = score; try { window.localStorage.setItem('gatekeeper_best', String(best)); } catch (e) { /* storage unavailable */ } }
+  SFX.over(); startEntry(); fetchBoard();
+}
+
+// ================= update =================
+function update(dt) {
+  time += dt; stateT += dt;
+  for (const f of floats) f.age += dt; floats = floats.filter(f => f.age < 1.1);
+  if (banner) { banner.t += dt; if (banner.t > banner.life) banner = null; }
+  if (lorryAnim >= 0) { lorryAnim += dt; if (lorryAnim > 3.8) lorryAnim = -1; }
+  if (palletFlash > 0) palletFlash -= dt;
+  if (laserFlash > 0) laserFlash -= dt;
+  if (shake > 0) shake -= dt;
+  if (entry) { if (entry.shake > 0) entry.shake -= dt; if (entry.done) entry.doneT += dt; }
+  if (state === 'title' || state === 'over') return;
+  if (state === 'shiftEnd') { updateRobot(dt); return; }
+
+  setGate(state === 'changeover' || (armed && held()));
+  gateAnim = clamp(gateAnim + (gateOpen ? 1 : -1) * dt / .04, 0, 1);
+
+  if (state === 'play') {
+    runT += dt; shiftT += dt;
+    ppm = Math.min(PPM_MAX, ppm + PPM_RATE * dt);
+    if (ppm > peak) peak = ppm; if (ppm > shiftStats.peak) shiftStats.peak = ppm;
+    if (shiftT >= SHIFT_LEN) pendingEnd = true;
+    nextSpawn -= dt; if (nextSpawn <= 0) spawn();
+  }
+  const want = beltSpeedFor(ppm);
+  if (state === 'play' && want > beltSet + .1) { beltSet = want; SFX.vroom(); float('BELT SPEED UP', 170, BELT_Y1 + 12, 3); }
+  const tgt = state === 'changeover' ? 80 : beltSet;
+  beltSpeed += (tgt - beltSpeed) * Math.min(1, dt * 3);
+  const speed = beltSpeed;
+  beltV = speed / 60; beltOff += speed * dt;
+  driveBelt(dt);
+  Engine.update(engine, 1000 / 60);
+  checkCrossings();
+  if (state === 'play') checkTrigger(dt);
+  updateRobot(dt);
+  updateTray(dt);
+  if (state === 'changeover') updateChangeover(dt);
+  if (state === 'play') tryPending();
+}
+
+// ================= drawing =================
+function drawItem(it, x, y, ang, z, inv) {
+  const dent = Math.min(.3, it.damage * .22), sq = it.squash * .16;
+  const sx = 1 - sq - dent * .5, sy = 1 + sq * .5 - dent * .3;
+  for (let k = 0; k < it.height; k++) drawSpr(it.key, k === 0 ? '3' : '2', x, y - z - k, ang, sx, sy);
+  const top = y - z - it.height;
+  drawSpr(it.key, inv ? 'inv' : 'n', x, top, ang, sx, sy);
+  if (it.damage >= 1 && SPR[it.crack]) drawSpr(it.crack, 'n', x, top, ang, sx, sy);
+}
+function drawFloor() {
+  rect(0, 0, W, H, 1);
+  for (let y = 14; y < H; y += 8) for (let x = 44 + ((y >> 3) & 1) * 4; x < W; x += 8) px(x, y, 2);
+}
+function drawOutfeed() {
+  rect(164, 12, 90, 96, 3); rect(166, 14, 86, 92, 2);
+  for (let y = 16; y < 106; y += 4) rect(166, y, 86, 1, 3);
+}
+function drawTray() {
+  const g = trayGeom(); const st = tray.state;
+  const ox = st === 'in' ? Math.round((1 - ease(Math.min(1, tray.t / .45))) * 90) : 0;
+  const x = g.x + ox, y = g.y;
+  const fl = st === 'flash' && Math.floor(tray.t * 12) % 2 === 0;
+  const c0 = fl ? 3 : 0, c1 = fl ? 2 : 1, c3 = fl ? 0 : 3;
+  rect(x, y + 3, g.w, g.h, 3);
+  rect(x, y, g.w, g.h, c3); rect(x + 1, y + 1, g.w - 2, g.h - 2, c0);
+  for (let i = 0; i < TRAY_SLOTS; i++) {
+    const sy = y + 3 + i * g.rowH; const s = tray.slots[i];
+    rect(x + 3, sy, g.w - 6, g.rowH - 2, c1);
+    if (s.flash > 0 && Math.floor(s.flash * 20) % 2) { rect(x + 2, sy - 1, g.w - 4, 1, 3); rect(x + 2, sy + g.rowH - 2, g.w - 4, 1, 3); }
+    for (const p of s.items) drawItem(p.it, x + g.w / 2 + p.x, sy + (g.rowH - 2) / 2 + p.it.height + p.y, p.ang, 0, fl);
+  }
+  if (st === 'cross' || st === 'trap') {
+    thickLine(x + 3, y + 3, x + g.w - 4, y + g.h - 4, 2, 3); thickLine(x + g.w - 4, y + 3, x + 3, y + g.h - 4, 2, 3);
+    thickLine(x + 3, y + 3, x + g.w - 4, y + g.h - 4, 0, 0); thickLine(x + g.w - 4, y + 3, x + 3, y + g.h - 4, 0, 0);
+  }
+  if (st === 'dissolve' || st === 'trap') {
+    const t = Math.min(1, tray.t / .45) * 16, col = st === 'trap' ? 3 : 2;
+    ctx.fillStyle = P[col];
+    for (let py = y; py < y + g.h + 3; py++) for (let pxx = x; pxx < x + g.w; pxx++)
+      if (BAYER[(py & 3) * 4 + (pxx & 3)] < t) ctx.fillRect(pxx, py, 1, 1);
+  }
+}
+function drawRack() { rect(96, 94, 26, 12, 3); rect(98, 96, 22, 3, 2); rect(100, 100, 10, 2, 1); }
+function drawBase() {
+  const x = SHOULDER.x;
+  rect(x - 12, 93, 25, 7, 3); rect(x - 7, 74, 15, 21, 3); rect(x - 6, 75, 13, 19, 0); rect(x - 6, 89, 13, 5, 1);
+}
+function drawBelt() {
+  const len = BELT_X1 - BELT_X0;
+  rect(BELT_X0 - 3, BELT_Y0 - 3, len + 6, BELT_Y1 - BELT_Y0 + 12, 3);
+  rect(BELT_X0, BELT_Y0, len, BELT_Y1 - BELT_Y0, 2);
+  const off = Math.floor(beltOff) % 8;
+  for (let x = BELT_X0 + off; x < BELT_X1; x += 8) for (let y = BELT_Y0 + 2; y < BELT_Y1 - 1; y += 5) rect(x, y, 1, 2, 3);
+  const off2 = Math.floor(beltOff) % 6;
+  for (let x = BELT_X0 + off2; x < BELT_X1; x += 6) rect(x, BELT_Y1 + 3, 2, 2, 2);
+  for (let x = BELT_X0 + 16; x < BELT_X1; x += 56) rect(x, BELT_Y1 + 9, 4, 12, 3);
+}
+function drawRail(pts, front) {
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+    thickLine(Math.max(x1, BELT_X0 - 2), y1 - 1, Math.min(x2, BELT_X1 + 2), y2 - 1, 1, 3);
+    thickLine(Math.max(x1, BELT_X0 - 2), y1 - 3, Math.min(x2, BELT_X1 + 2), y2 - 3, 0, front ? 0 : 1);
+  }
+}
+function drawLaser() {
+  const t = Math.round(railTop[0][1]), bt = Math.round(railBot[0][1]), x = Math.round(laserX);
+  rect(x - 1, t - 7, 3, 5, 3); rect(x - 1, bt - 2, 3, 5, 3);
+  const ph = Math.floor(time * (stallT > 0 ? 30 : 8)) % 2;
+  if (laserFlash > 0) rect(x, t - 1, 1, bt - t, 0);
+  else for (let y = t; y < bt - 1; y += 2) if (((y >> 1) + ph) % 2 === 0) px(x, y, 0);
+  px(x, t - 5, ph ? 0 : 1);
+}
+function drawShadows() {
+  shg.clearRect(0, 0, W, H); shg.fillStyle = '#000';
+  for (const b of items) drawSpr(b.plugin.item.key, '3', b.position.x + 2, b.position.y + 1, b.angle, 1, 1, shg);
+  if (gateAnim < .5) shg.fillRect(GATE_X + 2, Math.round(railTop[0][1]) - 1, 2, BELT_Y1 - Math.round(railTop[0][1]) + 2);
+  else for (let i = 0; i < 11; i++) shg.fillRect(GATE_X + 2 + i, BELT_Y1 + 6 + Math.floor(i * .5), 4, 2);
+  const hz = robot.z, off = 2 + hz * .5;
+  for (const c of robot.carried) drawSpr(c.it.key, '3', robot.x + c.dx + off, robot.y + c.dy + 1 + hz * .3, c.ang, 1, 1, shg);
+  const bw = robot.n * robot.w - 2;
+  shg.fillRect(Math.round(robot.x - bw / 2 + off), Math.round(robot.y - robot.h - 1 + hz * .3), bw, 3);
+  shg.globalCompositeOperation = 'source-in'; shg.fillStyle = ditherPat; shg.fillRect(0, 0, W, H);
+  shg.globalCompositeOperation = 'source-over';
+  ctx.drawImage(shCvs, 0, 0);
+}
+function drawItems() {
+  const list = items.slice().sort((a, b) => a.position.y - b.position.y);
+  for (const b of list) drawItem(b.plugin.item, b.position.x, b.position.y, b.angle, 0, false);
+}
+function drawGate() {
+  const pivY = BELT_Y1 + 2;
+  if (gateAnim < .5) {
+    const top = Math.round(lerp(railTop[0][1] - 1, pivY - 16, gateAnim * 2)), ht = 5;
+    rect(GATE_X - 2, top - ht - 1, 5, pivY - top + ht + 2, 3);
+    rect(GATE_X - 1, top - ht, 3, pivY - top, 0);
+    for (let y = top - ht + 2; y < pivY - ht; y += 4) rect(GATE_X - 1, y, 3, 2, 2);
+    rect(GATE_X - 1, pivY - ht, 3, ht, 1);
+  } else {
+    const len = Math.round(lerp(8, 20, (gateAnim - .5) * 2));
+    rect(GATE_X - 3, pivY - len - 1, 7, len + 3, 3);
+    rect(GATE_X - 2, pivY - len, 5, len, 1);
+    for (let y = pivY - len + 4; y < pivY - 1; y += 4) rect(GATE_X - 2, y, 5, 2, 2);
+    rect(GATE_X - 2, pivY - len, 5, 3, 0);
+  }
+  rect(GATE_X - 4, BELT_Y1 + 1, 9, 7, 3); rect(GATE_X - 2, BELT_Y1 + 3, 5, 3, 2);
+}
+function drawBin() {
+  rect(303, BELT_Y0 - 2, 17, 62, 3); rect(305, BELT_Y0, 15, 58, 2);
+  ctx.save(); ctx.beginPath(); ctx.rect(305, BELT_Y0, 15, 58); ctx.clip();
+  for (const w of pile) drawSpr(w.key, 'n', w.x, w.y, w.a, .6, .6);
+  ctx.restore();
+}
+function drawHood() {
+  rect(34, BELT_Y0 - 9, 14, BELT_Y1 - BELT_Y0 + 15, 3); rect(35, BELT_Y0 - 8, 12, 3, 2);
+  for (let y = BELT_Y0; y < BELT_Y1; y += 3) rect(46, y, 2, 2, 2);
+}
+function elbow(wx, wy) {
+  const dx = wx - SHOULDER.x, dy = wy - SHOULDER.y;
+  const d = clamp(Math.hypot(dx, dy), 4, L1 + L2 - .5), a = Math.atan2(dy, dx);
+  const b = Math.acos(clamp((L1 * L1 + d * d - L2 * L2) / (2 * L1 * d), -1, 1));
+  const e1 = { x: SHOULDER.x + L1 * Math.cos(a - b), y: SHOULDER.y + L1 * Math.sin(a - b) };
+  const e2 = { x: SHOULDER.x + L1 * Math.cos(a + b), y: SHOULDER.y + L1 * Math.sin(a + b) };
+  return e1.y < e2.y + 30 ? e1 : e2;
+}
+function drawRobot() {
+  const hx = Math.round(robot.x), headY = Math.round(robot.y - robot.z - robot.h - 2);
+  for (const c of robot.carried) drawItem(c.it, robot.x + c.dx, robot.y + c.dy, c.ang, robot.z, false);
+  const bw = robot.n * robot.w - 2, fl = robot.swapT > 0 && Math.floor(robot.swapT * 16) % 2;
+  for (let i = 0; i < robot.n; i++) rect(hx + (i - (robot.n - 1) / 2) * robot.w - 1, headY - 1, 3, 3, 3);
+  rect(hx - bw / 2 - 1, headY - 5, bw + 2, 5, 3); rect(hx - bw / 2, headY - 4, bw, 3, fl ? 0 : 2);
+  const wx = hx, wy = headY - 12;
+  rect(hx - 1, wy, 3, headY - wy - 4, 3);
+  const E = elbow(wx, wy);
+  thickLine(SHOULDER.x, SHOULDER.y, E.x, E.y, 4, 3); thickLine(E.x, E.y, wx, wy, 4, 3);
+  thickLine(SHOULDER.x, SHOULDER.y, E.x, E.y, 2, 0); thickLine(E.x, E.y, wx, wy, 2, 0);
+  disc(SHOULDER.x, SHOULDER.y, 6, 3); disc(SHOULDER.x, SHOULDER.y, 4, 1);
+  disc(E.x, E.y, 5, 3); disc(E.x, E.y, 3, 1);
+  disc(wx, wy, 4, 3); disc(wx, wy, 2, 1);
+}
+function drawLorry() {
+  if (lorryAnim < 0) return;
+  const x = Math.round(-34 + lorryAnim * 110);
+  drawSpr('lorry', 'n', x + 15, 168);
+  for (let i = 0; i < 4; i++) rect(x + 2 + i * 5, 158, 4, 3, 2);
+}
+function drawWorld() {
+  drawFloor(); drawOutfeed();
+  if (tray) drawTray();
+  drawRack(); drawBase(); drawBelt();
+  drawRail(railTop, false); drawLaser(); drawShadows(); drawItems(); drawGate(); drawRail(railBot, true);
+  drawLorry(); drawBin(); drawHood(); drawRobot();
+}
+function drawPallet(x, y, filled) {
+  if (filled) { rect(x, y, 30, 5, 0); for (let i = 1; i < 5; i++) rect(x + i * 6, y, 1, 5, 1); rect(x, y + 5, 30, 2, 3); rect(x + 2, y + 7, 4, 1, 3); rect(x + 24, y + 7, 4, 1, 3); }
+  else { rect(x, y + 5, 30, 2, 1); }
+}
+function drawTally() {
+  rect(0, 10, 38, H - 10, 2); rect(37, 10, 1, H - 10, 3);
+  text('LORRY', 3, 13, 0);
+  drawSpr('lorry', 'n', 17, 27);
+  text(pad(lorries, 2), 35, 36, 0, 'right');
+  text('PALLET', 3, 46, 0);
+  for (let i = 0; i < PALLETS_PER_LORRY; i++) {
+    const fl = palletFlash > 0 && i === pallets - 1 && Math.floor(palletFlash * 10) % 2;
+    if (!fl) drawPallet(4, 54 + i * 9, i < pallets);
+  }
+  text('TRAYS', 3, 102, 0);
+  for (let i = 0; i < TRAYS_PER_PALLET; i++) {
+    const x = 4 + (i % 2) * 16, y = 110 + (i >> 1) * 7;
+    if (i < traysInPallet) { rect(x, y, 14, 4, 0); rect(x, y + 4, 14, 1, 3); } else rect(x, y + 4, 14, 1, 1);
+  }
+  text('DUMPED', 3, 150, 0); text(pad(waste, 3), 3, 158, 0);
+  text('BEST', 3, 166, 1); text(pad(best, 5), 3, 173, 1);
+}
+function drawHUD() {
+  rect(0, 0, W, 10, 3);
+  const left = Math.max(0, SHIFT_LEN - shiftT);
+  text(SHIFTS[shiftIdx % 3] + ' ' + Math.floor(left / 60) + ':' + pad(left % 60, 2), 3, 3, 0);
+  const s = state === 'changeover' && co ? co.next : sku;
+  text(s.name + ' X' + s.n, 50, 3, 1);
+  text('SCORE ' + pad(score, 5), 122, 3, 0);
+  rect(198, 1, 46, 8, 1); text('PPM ' + pad(ppm, 3), 221, 3, 3, 'center');
+  for (let i = 0; i < MAX_STRIKES; i++) {
+    const x = 252 + i * 9; rect(x, 2, 7, 6, 2);
+    if (i < strikes) { for (let k = 0; k < 5; k++) { px(x + 1 + k, 2 + k + (k > 3 ? 0 : 0), 0); px(x + 5 - k, 2 + k, 0); } }
+  }
+  rect(307, 3, 2, 4, 0); rect(309, 2, 2, 6, 0);
+  if (!muted) { px(312, 3, 0); px(312, 6, 0); px(313, 4, 0); px(313, 5, 0); px(315, 2, 0); px(315, 7, 0); px(316, 3, 0); px(316, 4, 0); px(316, 5, 0); px(316, 6, 0); }
+  else { px(312, 3, 0); px(313, 4, 0); px(314, 5, 0); px(315, 6, 0); px(315, 3, 0); px(314, 4, 0); px(313, 5, 0); px(312, 6, 0); }
+}
+function drawFloats() {
+  for (const f of floats) if (f.age < .8 || Math.floor(f.age * 16) % 2) text(f.t, f.x, f.y - f.age * 12, f.c, 'center');
+}
+function card(x, y, w, h) { rect(x - 1, y - 1, w + 2, h + 2, 0); rect(x, y, w, h, 3); rect(x + 2, y + 2, w - 4, 1, 2); rect(x + 2, y + h - 3, w - 4, 1, 2); }
+function drawBanner() {
+  if (!banner) return;
+  if (banner.t > banner.life - .3 && Math.floor(banner.t * 20) % 2) return;
+  card(84, 52, 152, 30);
+  text(banner.a, 160, 57, 0, 'center', 2);
+  text(banner.b, 160, 71, 1, 'center');
+}
+function statRow(label, val, y) { text(label, 82, y, 1); text(val, 238, y, 0, 'right'); }
+function drawTitle() {
+  card(36, 18, 248, 142);
+  text('GATEKEEPER', 160, 28, 0, 'center', 3);
+  text('END OF LINE QUALITY CONTROL', 160, 50, 1, 'center');
+  if (Math.floor(time / 6) % 2) {
+    text('TOP SHIFTS', 160, 58, 0, 'center');
+    drawBoard(68, -1);
+  } else {
+    text('HOLD ANY KEY, CLICK OR TAP TO LIFT THE GATE', 160, 66, 0, 'center');
+    text('LET GO TO DROP IT. ANYTHING PAST IT IS BINNED.', 160, 74, 0, 'center');
+    text('WHEN A BATCH BACKS UP TO THE LASER,', 160, 88, 1, 'center');
+    text('THE ROBOT PACKS IT NO MATTER WHAT IS IN IT.', 160, 96, 1, 'center');
+    text('BIN THE CATS AND CRICKET BATS. KEEP THE GOOD STUFF.', 160, 104, 1, 'center');
+    text('EACH BAD TRAY IS A STRIKE. THREE AND YOU ARE OUT.', 160, 112, 1, 'center');
+  }
+  if (Math.floor(time * 2.5) % 2) text('PRESS TO CLOCK IN', 160, 130, 0, 'center', 2);
+  text('BEST ' + pad(best, 5), 160, 148, 2, 'center');
+}
+function drawShiftCard() {
+  card(70, 30, 180, 112);
+  text(SHIFTS[shiftIdx % 3] + ' SHIFT DONE', 160, 38, 0, 'center', 2);
+  statRow('GOOD TRAYS', pad(shiftStats.trays, 3), 56);
+  statRow('PALLETS', pad(shiftStats.pallets, 3), 65);
+  statRow('BAD TRAYS', pad(shiftStats.bad, 3), 74);
+  statRow('GOOD PACKS DUMPED', pad(shiftStats.waste, 3), 83);
+  statRow('PEAK PPM', pad(shiftStats.peak, 3), 92);
+  statRow('SCORE', pad(score, 5), 101);
+  if (stateT > 1 && Math.floor(time * 2.5) % 2) text('PRESS FOR ' + SHIFTS[(shiftIdx + 1) % 3] + ' SHIFT', 160, 124, 0, 'center');
+}
+// ---- scoreboard (kept in this browser for now) ----
+const DEFAULT_SCORES = [{ n: 'GABO', s: 400 }, { n: 'VERONICA', s: 300 }];
+let board = DEFAULT_SCORES.map(r => ({ ...r }));
+try { const b = JSON.parse(window.localStorage.getItem('gatekeeper_board') || 'null'); if (Array.isArray(b) && b.length) board = b; } catch (e) { /* keep defaults */ }
+// shared scoreboard on the Netlify site; falls back to this browser's board if unreachable
+const API = '/api/scores';
+let online = false;
+async function fetchBoard() {
+  try {
+    const r = await fetch(API, { cache: 'no-store' });
+    if (!r.ok) throw new Error('status ' + r.status);
+    const j = await r.json();
+    if (Array.isArray(j.top)) { board = j.top; online = true; }
+  } catch (e) { online = false; }
+}
+function addScore(n, s) {
+  const row = { n, s: Math.floor(s) };
+  board.push(row); board.sort((a, b) => b.s - a.s); board = board.slice(0, 10);
+  try { window.localStorage.setItem('gatekeeper_board', JSON.stringify(board)); } catch (e) { /* storage unavailable */ }
+  const payload = { name: n, score: Math.floor(s), secs: Math.round(runT), trays: stats.trays, pallets: stats.pallets,
+    lorries: stats.lorries, waste: stats.waste, peak: Math.floor(peak) };
+  fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)))
+    .then(j => { if (Array.isArray(j.top)) { board = j.top; online = true; if (entry) entry.rank = typeof j.rank === 'number' ? j.rank : -1; } })
+    .catch(() => { online = false; });
+  return board.indexOf(row);
+}
+fetchBoard();
+function drawBoard(y, hi) {
+  const blink = Math.floor(time * 4) % 2;
+  if (!online) text('OFFLINE: THIS DEVICE ONLY', 160, y + Math.min(8, board.length) * 7 + 2, 2, 'center');
+  board.slice(0, 8).forEach((r, i) => {
+    if (i === hi && !blink) return;
+    const c = (i === hi || i === 0) ? 0 : 1, yy = y + i * 7;
+    text((i + 1) + '.', 110, yy, c, 'right'); text(r.n, 116, yy, c); text(pad(r.s, 5), 212, yy, c, 'right');
+  });
+}
+
+// ---- arcade name entry on the SENT HOME card ----
+const NAME_LEN = 8, NAME_CHARS = ' ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+let entry = null, lastName = '';
+try { lastName = window.localStorage.getItem('gatekeeper_name') || ''; } catch (e) { lastName = ''; }
+const slotX = i => 121 + i * 10;
+const ENTRY_BTNS = [['^', 'up'], ['~', 'down'], ['<', 'left'], ['>', 'right'], ['OK', 'ok']].map(([l, a], i) => ({ l, a, x: 111 + i * 20, y: 134, w: 18, h: 11 }));
+function startEntry() {
+  entry = { chars: (lastName + ' '.repeat(NAME_LEN)).slice(0, NAME_LEN).split(''), pos: Math.min(NAME_LEN - 1, lastName.length), done: false, doneT: 0, shake: 0 };
+}
+function entryName() { return entry.chars.join('').trim(); }
+function entryCycle(d) {
+  const i = Math.max(0, NAME_CHARS.indexOf(entry.chars[entry.pos]));
+  entry.chars[entry.pos] = NAME_CHARS[(i + d + NAME_CHARS.length) % NAME_CHARS.length]; SFX.tick();
+}
+function entryMove(d) { entry.pos = clamp(entry.pos + d, 0, NAME_LEN - 1); SFX.tick(); }
+function entryType(ch) { entry.chars[entry.pos] = ch; if (entry.pos < NAME_LEN - 1) entry.pos++; SFX.tick(); }
+function entryBack() { if (entry.chars[entry.pos] === ' ' && entry.pos > 0) entry.pos--; entry.chars[entry.pos] = ' '; SFX.tick(); }
+function entryConfirm() {
+  const n = entryName();
+  if (!n) { entry.shake = .3; SFX.waste(); return; }
+  entry.chars = (n + ' '.repeat(NAME_LEN)).slice(0, NAME_LEN).split('');
+  entry.done = true; entry.doneT = 0; lastName = n; entry.rank = addScore(n, score);
+  try { window.localStorage.setItem('gatekeeper_name', n); } catch (e) { /* storage unavailable */ }
+  SFX.good();
+}
+function entryKey(e) {
+  const k = e.key;
+  if (k === 'ArrowUp') entryCycle(1);
+  else if (k === 'ArrowDown') entryCycle(-1);
+  else if (k === 'ArrowLeft') entryMove(-1);
+  else if (k === 'ArrowRight') entryMove(1);
+  else if (e.repeat) return;
+  else if (k === 'Enter') entryConfirm();
+  else if (k === 'Backspace' || k === 'Delete') entryBack();
+  else if (k === ' ') entryType(' ');
+  else if (k.length === 1 && /[a-z]/i.test(k)) entryType(k.toUpperCase());
+}
+function entryTap(x, y) {
+  for (const b of ENTRY_BTNS) if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) {
+    if (b.a === 'up') entryCycle(1); else if (b.a === 'down') entryCycle(-1);
+    else if (b.a === 'left') entryMove(-1); else if (b.a === 'right') entryMove(1); else entryConfirm();
+    return;
+  }
+  for (let i = 0; i < NAME_LEN; i++) { const sx = slotX(i); if (x >= sx - 2 && x < sx + 8 && y >= 112 && y < 130) { entry.pos = i; SFX.tick(); return; } }
+}
+function drawOverCard() {
+  card(56, 12, 208, 158);
+  text('SENT HOME', 160, 18, 0, 'center', 3);
+  text('THREE BAD TRAYS', 160, 37, 1, 'center');
+  if (entry && entry.done) { text('TOP SHIFTS', 160, 45, 0, 'center'); drawBoard(54, entry.rank); }
+  else {
+    statRow('LORRIES', pad(stats.lorries, 3), 47);
+    statRow('PALLETS', pad(stats.pallets, 3), 54);
+    statRow('GOOD TRAYS', pad(stats.trays, 3), 61);
+    statRow('GOOD PACKS DUMPED', pad(stats.waste, 3), 68);
+    statRow('PEAK PPM', pad(peak, 3), 75);
+    statRow('SCORE', pad(score, 5), 82);
+    statRow('BEST', pad(best, 5), 89);
+  }
+  if (!entry) return;
+  const blink = Math.floor(time * 4) % 2;
+  if (!entry.done) {
+    text('ENTER YOUR NAME', 160, 101, 0, 'center');
+    const sh = entry.shake > 0 ? (Math.floor(time * 40) % 2 ? 1 : -1) : 0;
+    for (let i = 0; i < NAME_LEN; i++) {
+      const x = slotX(i) + sh, cur = i === entry.pos;
+      if (entry.chars[i] !== ' ') text(entry.chars[i], x, 113, cur ? 0 : 1, 'left', 2);
+      rect(x - 1, 125, 8, 1, cur ? (blink ? 0 : 3) : 2);
+    }
+    for (const b of ENTRY_BTNS) { rect(b.x, b.y, b.w, b.h, 2); rect(b.x, b.y + b.h - 1, b.w, 1, 1); text(b.l, b.x + b.w / 2, b.y + 3, 0, 'center'); }
+    text(document.hasFocus && !document.hasFocus() ? 'CLICK THE GAME FIRST, THEN TYPE' : 'TYPE OR USE ARROWS. ENTER TO SAVE', 160, 152, 1, 'center');
+  } else {
+    text('SIGNED OFF BY', 160, 104, 1, 'center');
+    text(entryName(), 160, 114, 0, 'center', 2);
+    if (entry.doneT > .6 && blink) text('PRESS TO CLOCK IN AGAIN', 160, 140, 0, 'center');
+  }
+}
+function drawRotate() {
+  rect(0, 0, W, H, 3);
+  const land = Math.floor(time * 1.2) % 2;
+  if (land) { rect(136, 72, 48, 28, 0); rect(139, 75, 42, 22, 2); } else { rect(146, 60, 28, 48, 0); rect(149, 63, 22, 42, 2); }
+  text('TURN YOUR PHONE SIDEWAYS', 160, 124, 0, 'center');
+}
+function render() {
+  if (portrait) { drawRotate(); return; }
+  ctx.save(); if (shake > 0) ctx.translate(0, 1);
+  drawWorld(); ctx.restore();
+  drawTally(); drawHUD(); drawFloats(); drawBanner();
+  if (state === 'title') drawTitle(); else if (state === 'shiftEnd') drawShiftCard(); else if (state === 'over') drawOverCard();
+}
+
+// ================= sound =================
+let AC = null, master = null, noiseBuf = null;
+function initAudio() {
+  try {
+    if (!AC) {
+      const A = window.AudioContext || window.webkitAudioContext; if (!A) return;
+      AC = new A(); master = AC.createGain(); master.gain.value = .3; master.connect(AC.destination);
+      const len = AC.sampleRate * .5; noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      const d = noiseBuf.getChannelData(0); for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f, d, type, g, f2, dl) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + (dl || 0), o = AC.createOscillator(), gn = AC.createGain();
+  o.type = type || 'square'; o.frequency.setValueAtTime(f, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+  gn.gain.setValueAtTime(g || .15, t); gn.gain.exponentialRampToValueAtTime(.0001, t + d);
+  o.connect(gn); gn.connect(master); o.start(t); o.stop(t + d + .05);
+}
+function noise(d, type, freq, g, dl, q) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + (dl || 0), s = AC.createBufferSource(), f = AC.createBiquadFilter(), gn = AC.createGain();
+  s.buffer = noiseBuf; f.type = type; f.frequency.value = freq; f.Q.value = q || 1;
+  gn.gain.setValueAtTime(g, t); gn.gain.exponentialRampToValueAtTime(.0001, t + d);
+  s.connect(f); f.connect(gn); gn.connect(master); s.start(t); s.stop(t + d + .05);
+}
+const SFX = {
+  up() { noise(.035, 'highpass', 2400, .8); tone(1600, .03, 'square', .12, 600); },
+  down() { noise(.05, 'bandpass', 1200, 1, 0, .7); tone(260, .08, 'triangle', .45, 45); tone(1800, .02, 'square', .08); },
+  laser() { tone(2200, .04, 'square', .05, 2600); },
+  suck() { noise(.18, 'lowpass', 2600, .25); tone(500, .12, 'sawtooth', .04, 180); },
+  drop() { noise(.2, 'highpass', 3000, .25); tone(700, .2, 'square', .08, 150); },
+  snap() { tone(2000, .02, 'square', .1); tone(2800, .03, 'square', .08, null, .03); },
+  clunk() { tone(160, .09, 'square', .15, 90); },
+  good() { [523, 659, 784, 1047].forEach((f, i) => tone(f, .09, 'square', .1, null, i * .07)); },
+  bad() {
+    // a big sung "uh-oh": two falling vowels through a formant filter
+    if (!AC || muted) return;
+    const t = AC.currentTime;
+    const note = (start, len, f0, f1, vowel, pk) => {
+      const o = AC.createOscillator(), f = AC.createBiquadFilter(), f2 = AC.createBiquadFilter(), g = AC.createGain();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(f0, t + start); o.frequency.linearRampToValueAtTime(f1, t + start + len);
+      const lfo = AC.createOscillator(), lg = AC.createGain(); lfo.frequency.value = 6; lg.gain.value = f0 * .025;
+      lfo.connect(lg); lg.connect(o.frequency); lfo.start(t + start + len * .3); lfo.stop(t + start + len + .05);
+      f.type = 'bandpass'; f.Q.value = 4; f.frequency.value = vowel[0];
+      f2.type = 'bandpass'; f2.Q.value = 5; f2.frequency.value = vowel[1];
+      g.gain.setValueAtTime(.0001, t + start); g.gain.exponentialRampToValueAtTime(pk, t + start + .04);
+      g.gain.setValueAtTime(pk, t + start + len * .7); g.gain.exponentialRampToValueAtTime(.0001, t + start + len);
+      o.connect(f); o.connect(f2); f.connect(g); f2.connect(g); g.connect(master);
+      o.start(t + start); o.stop(t + start + len + .05);
+    };
+    note(0, .3, 392, 380, [640, 1190], 1.1);      // "uh"
+    note(.34, .75, 262, 233, [450, 850], 1.2);    // "oh"
+    tone(80, .5, 'triangle', .35, 45, .34);
+  },
+  trap() { tone(120, .25, 'square', .15, 40); },
+  whoosh() { noise(.35, 'bandpass', 1800, .25, 0, .5); },
+  pallet() { [392, 523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, .1, 'square', .1, null, i * .06)); },
+  lorry() { tone(311, .25, 'square', .12); tone(392, .35, 'square', .12, null, .28); },
+  waste() { tone(180, .08, 'square', .1, 120); },
+  nice() { tone(1319, .05, 'square', .07); tone(1760, .06, 'square', .07, null, .05); },
+  swap() { noise(.12, 'highpass', 1500, .3); tone(900, .08, 'square', .08, 1400); },
+  chime() { tone(784, .15, 'triangle', .15); tone(1047, .25, 'triangle', .15, null, .15); },
+  over() { [392, 330, 262, 196].forEach((f, i) => tone(f, .18, 'square', .12, null, i * .16)); },
+  start() { [262, 330, 392, 523].forEach((f, i) => tone(f, .07, 'square', .1, null, i * .06)); },
+  slide() { noise(.12, 'lowpass', 900, .12); },
+  tick() { tone(1200, .025, 'square', .06); },
+  vroom() {
+    if (!AC || muted) return;
+    const t = AC.currentTime, f = AC.createBiquadFilter(), g = AC.createGain();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(300, t); f.frequency.exponentialRampToValueAtTime(2200, t + .45); f.frequency.exponentialRampToValueAtTime(900, t + .8);
+    g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(.32, t + .08);
+    g.gain.setValueAtTime(.32, t + .5); g.gain.exponentialRampToValueAtTime(.0001, t + .9);
+    for (const [type, d] of [['sawtooth', 1], ['square', 1.027]]) {
+      const o = AC.createOscillator(); o.type = type;
+      o.frequency.setValueAtTime(55 * d, t); o.frequency.exponentialRampToValueAtTime(190 * d, t + .45); o.frequency.exponentialRampToValueAtTime(130 * d, t + .8);
+      o.connect(f); o.start(t); o.stop(t + .95);
+    }
+    f.connect(g); g.connect(master);
+    noise(.5, 'bandpass', 700, .12, 0, .8);
+  },
+  meow(angry) {
+    if (!AC || muted) return;
+    const t = AC.currentTime, o = AC.createOscillator(), f = AC.createBiquadFilter(), g = AC.createGain();
+    const b = angry ? 640 : 470, pk = angry ? .55 : .38, len = angry ? .6 : .5;
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(b, t);
+    o.frequency.linearRampToValueAtTime(b * 1.6, t + .12);
+    o.frequency.linearRampToValueAtTime(b * 1.3, t + len * .6);
+    o.frequency.linearRampToValueAtTime(b * .75, t + len);
+    if (angry) { const lfo = AC.createOscillator(), lg = AC.createGain(); lfo.frequency.value = 18; lg.gain.value = 40; lfo.connect(lg); lg.connect(o.frequency); lfo.start(t); lfo.stop(t + len + .05); }
+    f.type = 'bandpass'; f.Q.value = 3;
+    f.frequency.setValueAtTime(650, t); f.frequency.linearRampToValueAtTime(1600, t + .15); f.frequency.linearRampToValueAtTime(850, t + len);
+    g.gain.setValueAtTime(.0001, t); g.gain.exponentialRampToValueAtTime(pk, t + .05);
+    g.gain.setValueAtTime(pk, t + len * .6); g.gain.exponentialRampToValueAtTime(.0001, t + len);
+    o.connect(f); f.connect(g); g.connect(master); o.start(t); o.stop(t + len + .05);
+  },
+};
+
+// ================= input =================
+function onPress() {
+  initAudio();
+  if (state === 'title') { resetGame(); SFX.start(); }
+  else if (state === 'shiftEnd' && stateT > 1) nextShift();
+  else if (state === 'over' && entry && entry.done && entry.doneT > .6) { resetGame(); SFX.start(); }
+}
+function onRelease() { if (!held()) armed = true; }
+window.addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (state === 'over' && entry && !entry.done) {
+    e.preventDefault();
+    if (stateT > .8) { initAudio(); entryKey(e); }
+    return;
+  }
+  if (e.code === 'Space' || e.code.startsWith('Arrow') || e.code === 'Tab') e.preventDefault();
+  if (e.repeat) return;
+  keys.add(e.code); onPress();
+});
+window.addEventListener('keyup', e => { keys.delete(e.code); onRelease(); });
+window.addEventListener('blur', () => { keys.clear(); pointers.clear(); onRelease(); });
+window.addEventListener('pointerdown', e => {
+  // grab keyboard focus (pointer preventDefault below would otherwise stop the click from doing it)
+  try { window.focus(); cvs.focus({ preventScroll: true }); } catch (err) { /* ignore */ }
+  const r = cvs.getBoundingClientRect();
+  const x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
+  if (x >= 303 && x <= W && y >= 0 && y <= 11) { muted = !muted; initAudio(); return; }
+  if (state === 'over' && entry && !entry.done) { if (stateT > .8) { initAudio(); entryTap(x, y); } if (e.cancelable) e.preventDefault(); return; }
+  pointers.add(e.pointerId); onPress();
+  if (e.cancelable) e.preventDefault();
+}, { passive: false });
+const up = e => { pointers.delete(e.pointerId); onRelease(); };
+window.addEventListener('pointerup', up);
+window.addEventListener('pointercancel', up);
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+function resize() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const coarse = window.matchMedia && window.matchMedia('(pointer: coarse)').matches;
+  portrait = coarse && vh > vw;
+  let s = Math.min((vw - 28) / W, (vh - 28) / H);
+  if (s >= 1) s = Math.floor(s);
+  s = Math.max(s, .5);
+  cvs.style.width = (W * s) + 'px'; cvs.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ================= boot =================
+setPalette('day'); genSprites(); applySku(SKUS.strawb);
+let last = 0, acc = 0;
+function frame(now) {
+  if (!last) last = now;
+  let dt = (now - last) / 1000; last = now; if (dt > .25) dt = .25;
+  if (!portrait) {
+    acc += dt; let n = 0;
+    while (acc >= STEP && n < 8) { update(STEP); acc -= STEP; n++; }
+    if (n >= 8) acc = 0;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>

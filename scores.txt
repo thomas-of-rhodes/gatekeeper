@@ -1,0 +1,3 @@
+date	name	score	secs	trays	pallets	lorries	waste	peak
+-	GABO	400	0	0	0	0	0	0
+-	VERONICA	300	0	0	0	0	0	0
