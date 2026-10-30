@@ -5,3 +5,4 @@ date	name	score	secs	trays	pallets	lorries	waste	peak
 2026-10-29 19:02	F	160	91	1	0	0	0	90
 2026-10-30 08:36	THOMAS	640	141	4	0	0	2	113
 2026-10-30 08:39	FELIX	1095	181	7	0	0	7	131
+2026-10-30 08:50	JACK	110	109	1	0	0	10	98
