@@ -9,3 +9,4 @@ date	name	score	secs	trays	pallets	lorries	waste	peak
 2026-10-30 08:50	NIGEL	595	149	4	0	0	9	117
 2026-10-30 08:51	DAVEC	610	162	4	0	0	22	123
 2026-10-30 08:52	JACK	445	127	3	0	0	7	106
+2026-10-30 08:54	DAISY	0	83	0	0	0	4	87
