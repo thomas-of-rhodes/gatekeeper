@@ -44,3 +44,4 @@ date	name	score	secs	trays	pallets	lorries	waste	peak
 2026-11-02 09:14	TASH	930	170	6	0	0	6	126
 2026-11-02 09:17	TASH	765	165	5	0	0	7	124
 2026-11-02 16:21	MARCELL	2065	232	12	1	0	7	150
+2026-11-06 15:10	M	0	68	0	0	0	0	80
